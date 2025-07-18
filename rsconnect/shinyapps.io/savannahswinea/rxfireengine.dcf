@@ -1,10 +1,12 @@
 name: rxfireengine
-title:
+title: RxFireEngine
 username: savannahswinea
 account: savannahswinea
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 15095218
-bundleId: 10638126
+bundleId: 10638986
 url: https://savannahswinea.shinyapps.io/rxfireengine/
 version: 1
+asMultiple: FALSE
+asStatic: FALSE
