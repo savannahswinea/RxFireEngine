@@ -5,6 +5,6 @@ account: savannahswinea
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 15095218
-bundleId: 10687205
+bundleId: 10687289
 url: https://savannahswinea.shinyapps.io/rxfireengine/
 version: 1

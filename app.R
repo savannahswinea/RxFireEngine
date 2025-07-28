@@ -82,7 +82,7 @@ ui <- fluidPage(
                         tags$p(class = "fade-line",
                                tags$a(href = "RxFire_example.xlsx", download = NA, "Click here to download the example spreadsheet.")
                         ),
-                        tags$p(class = "fade-line", "For questions or feedback, please contact your RxFire support team.")
+                        tags$p(class = "fade-line", "For questions or feedback, please contact Savannah Swinea at sswinea@ncsu.edu.")
                       )
                )
              )
