@@ -2,8 +2,12 @@ library(shiny)
 library(httr2)
 library(tidyverse)
 library(lubridate)
+library(sf)
+library(readxl)
+library(leaflet)
 
-# Function to get 3-day weather
+# ---- Function to get 3-day weather ----
+# Inspired by https://3mw.albert-rapp.de/p/weather-api
 get_forecast <- function(lat, lon) {
   # Get point metadata including grid data URL
   point_meta <- request("https://api.weather.gov") |>
@@ -40,6 +44,9 @@ get_forecast <- function(lat, lon) {
   
   # Combine and summarize to daily average values for next 3 days
   forecast_all <- bind_rows(temp_max, temp_min, wind_speed, rh_min, precip_amt) |>
+    mutate(
+      value = ifelse(variable %in% c("max_temp", "min_temp"), value * 9/5 + 32, value)
+    ) |>
     filter(date <= Sys.Date() + 3) |>
     group_by(date, variable) |>
     summarize(value = mean(value, na.rm = TRUE), .groups = "drop") |>
@@ -48,97 +55,263 @@ get_forecast <- function(lat, lon) {
   forecast_all
 }
 
+# ---- UI ----
 ui <- fluidPage(
   titlePanel("RxFire Engine Prototype"),
   
   tabsetPanel(
+    tabPanel("Welcome!",
+             fluidRow(
+               column(8, offset = 2,
+                      tags$div(
+                        id = "welcome-text",
+                        tags$p(class = "fade-line", "This app helps fire managers make prescribed burn decisions using short-term weather forecasts and habitat rotation intervals.",
+                               style = "margin-top: 20px;"),
+                        tags$h4(class = "fade-line", "What You Need"),
+                        tags$ul(
+                          class = "fade-line",
+                          tags$li("If you have a shapefile (.zip), the attribute table needs the following columns:"),
+                          tags$ul(
+                            tags$li("Unit: a unique name for each unit"),
+                            tags$li("Habitat: a habitat classification for that unit"),
+                            tags$li("YearsSinceBurn: how many years ago a unit was burned")
+                          ),
+                          tags$li("If you have a spreadsheet (.csv or .xlsx), you also need Latitude and Longitude columns.")
+                        ),
+                        tags$h4(class = "fade-line", "Download Example Data"),
+                        tags$p(class = "fade-line",
+                               tags$a(href = "RxFire_example.xlsx", download = NA, "Click here to download the example spreadsheet.")
+                        ),
+                        tags$p(class = "fade-line", "For questions or feedback, please contact your RxFire support team.")
+                      )
+               )
+             )
+    ),
+    
     tabPanel("Weather Forecast",
              sidebarLayout(
                sidebarPanel(
-                 numericInput("lat", "Latitude:", value = 38.8894),
-                 numericInput("lon", "Longitude:", value = -77.0352),
-                 actionButton("get_forecast", "Get Forecast")
+                 fileInput("file_upload", "Upload shapefile (.zip) or spreadsheet (.csv/.xlsx)"),
+                 actionButton("run_forecast", "Run Forecast")
                ),
                mainPanel(
-                 tableOutput("forecast_table")
+                 uiOutput("forecast_bullets"),
+                 leafletOutput("unit_map", height = 400)
                )
              )
     ),
     
-    tabPanel("Plot y = x²",
+    tabPanel("Habitat Rotation Intervals",
              sidebarLayout(
                sidebarPanel(
-                 numericInput("x_input", "Enter a value for x:", value = 1)
+                 h4("Instructions"),
+                 p("Adjust the minimum and maximum rotation intervals (in years) for each habitat below. Then click 'Evaluate Units' to receive guidance on which units are ready to burn."),
+                 br(),
+                 uiOutput("threshold_inputs"),
+                 actionButton("evaluate", "Evaluate Units")
                ),
+               
                mainPanel(
-                 plotOutput("plot_y")
+                 h3("Which units are ready to burn?"),
+                 uiOutput("burn_feedback")
                )
              )
     ),
     
-    tabPanel("Plot z = log(y)",
+    tabPanel("Burn Optimization",
              mainPanel(
-               plotOutput("plot_z"),
-               textOutput("y_value"),
-               tableOutput("xy_table")
              )
     )
+  ),
+  
+  tags$head(
+    tags$style(HTML("
+    .fade-line {
+      opacity: 0;
+      transition: opacity 1s ease-in;
+    }
+    .fade-line.visible {
+      opacity: 1;
+    }
+  ")),
+    tags$script(HTML("
+    $(document).ready(function(){
+      let lines = $('#welcome-text .fade-line');
+      lines.each(function(i, el) {
+        setTimeout(function() {
+          $(el).addClass('visible');
+        }, i * 2000); // fade in every 2000ms
+      });
+    });
+  "))
   )
 )
 
+# ---- Server ----
 server <- function(input, output, session) {
+  shared <- reactiveValues(y = NULL, habitats = NULL)
   
-  # Weather forecast reactive
-  forecast_data <- eventReactive(input$get_forecast, {
-    req(input$lat, input$lon)
-    tryCatch({
-      get_forecast(input$lat, input$lon)
-    }, error = function(e) {
-      tibble(error = "Failed to get forecast")
+  # Helper to normalize lat/lon column names
+  normalize_latlon <- function(df) {
+    lat_names <- c("Latitude", "Lat", "latitude", "lat")
+    lon_names <- c("Longitude", "Long", "longitude", "long")
+    
+    lat_col <- intersect(names(df), lat_names)
+    lon_col <- intersect(names(df), lon_names)
+    
+    validate(
+      need(length(lat_col) > 0 && length(lon_col) > 0, 
+           "Spreadsheet must include recognizable latitude and longitude columns.")
+    )
+    
+    df <- df |>
+      rename(Latitude = all_of(lat_col[1]),
+             Longitude = all_of(lon_col[1]))
+    
+    df
+  }
+  
+  # Read uploaded file and extract lat/lon
+  get_points_from_upload <- reactive({
+    req(input$file_upload)
+    ext <- tools::file_ext(input$file_upload$name)
+    temp_dir <- tempdir()
+    
+    if (ext == "zip") {
+      unzip(input$file_upload$datapath, exdir = temp_dir)
+      shp_file <- list.files(temp_dir, pattern = "\\.shp$", full.names = TRUE)
+      shp_data <- st_read(shp_file[1])
+      centroids <- st_centroid(shp_data)
+      coords <- st_coordinates(centroids)
+      df <- data.frame(
+        Unit = shp_data$Name %||% paste0("Unit_", seq_len(nrow(shp_data))),
+        Latitude = coords[,2],
+        Longitude = coords[,1],
+        stringsAsFactors = FALSE
+      )
+      
+    } else if (ext %in% c("csv", "xlsx")) {
+      if (ext == "csv") {
+        df <- read_csv(input$file_upload$datapath)
+      } else {
+        df <- read_excel(input$file_upload$datapath)
+      }
+      
+      df <- normalize_latlon(df)
+    } else {
+      showNotification("Unsupported file type", type = "error")
+      return(NULL)
+    }
+  })
+  
+  # Run forecast on each point
+  forecast_data <- eventReactive(input$run_forecast, {
+    points <- get_points_from_upload()
+    req(points)
+    
+    points |>
+      rowwise() |>
+      mutate(
+        forecast = list(tryCatch(
+          get_forecast(Latitude, Longitude),
+          error = function(e) tibble(error = "NWS request failed"))
+        )
+      ) |>
+      unnest(forecast)
+  })
+  
+  # Map units
+  output$unit_map <- renderLeaflet({
+    df <- forecast_data()
+    req(df)
+    
+    leaflet(df) |>
+      addTiles() |>
+      addCircleMarkers(
+        lng = ~Longitude, lat = ~Latitude,
+        label = ~Unit, radius = 5,
+        fillOpacity = 0.8, color = "blue"
+      )
+  })
+  
+  # Output max temp in 3-day interval for each unit
+  output$forecast_bullets <- renderUI({
+    df <- forecast_data()
+    req(df)
+    
+    df_max <- df |>
+      group_by(Unit) |>
+      filter(max_temp == max(max_temp, na.rm = TRUE)) |>
+      slice_head(n = 1) |>  # In case of ties, take the first
+      ungroup()
+    
+    bullets <- df_max |>
+      mutate(msg = paste0(
+        "<li><strong>", Unit, "</strong> will experience a maximum temperature of <strong>", 
+        round(max_temp, 1), "°F</strong> on <strong>", date, "</strong> in the next three days.</li>"
+      )) |>
+      pull(msg) |>
+      paste(collapse = "\n")
+    
+    HTML(paste0("<ul>", bullets, "</ul>"))
+  })
+  
+  # Reactive: Get unique habitats
+  unique_habitats <- reactive({
+    req(get_points_from_upload())
+    unique(get_points_from_upload()$Habitat)
+  })
+  
+  # Dynamic UI: min/max inputs for each Habitat
+  output$threshold_inputs <- renderUI({
+    req(unique_habitats())
+    lapply(unique_habitats(), function(hab) {
+      safe_id <- make.names(hab)  # sanitize input ID
+      tagList(
+        h4(hab),
+        numericInput(paste0("min_", safe_id), "Min Years Since Burn", value = 1),
+        numericInput(paste0("max_", safe_id), "Max Years Since Burn", value = 5)
+      )
     })
   })
   
-  output$forecast_table <- renderTable({
-    forecast_data()
-  })
-  
-  ## ---- y = x^2 ----
-  shared <- reactiveValues(y = NULL)
-  
-  observe({
-    shared$y <- input$x_input^2
-  })
-  
-  output$plot_y <- renderPlot({
-    x <- input$x_input
-    y <- x^2
-    plot(x, y, pch = 16, col = "blue",
-         main = "y = x²",
-         xlab = "x", ylab = "y")
-  })
-  
-  ## ---- z = log(y) ----
-  output$plot_z <- renderPlot({
-    req(shared$y)
-    z <- log(shared$y)
-    plot(shared$y, z, pch = 16, col = "darkgreen",
-         main = "z = log(y)",
-         xlab = "y", ylab = "z")
-  })
-  
-  output$y_value <- renderText({
-    req(shared$y)
-    paste("Current value of y:", round(shared$y, 2))
-  })
-  
-  output$xy_table <- renderTable({
-    req(shared$y)
-    data.frame(
-      x = input$x_input,
-      y = shared$y
-    )
+  # Reactive: Generate feedback after evaluation
+  output$burn_feedback <- renderUI({
+    req(input$evaluate)
+    isolate({
+      df <- get_points_from_upload()
+      req(all(c("Unit", "Habitat", "YearsSinceBurn") %in% names(df)))
+      
+      habs <- unique_habitats()
+      
+      # Collect thresholds
+      thresholds <- lapply(habs, function(hab) {
+        safe_id <- make.names(hab)
+        data.frame(
+          Habitat = hab,
+          Min = input[[paste0("min_", safe_id)]],
+          Max = input[[paste0("max_", safe_id)]],
+          stringsAsFactors = FALSE
+        )
+      }) %>% bind_rows()
+      
+      # Join thresholds to input data
+      df <- df %>% left_join(thresholds, by = "Habitat")
+      
+      # Generate messages
+      df <- df %>%
+        rowwise() %>%
+        mutate(message = case_when(
+          is.na(YearsSinceBurn) ~ paste(Unit, "has missing burn data."),
+          YearsSinceBurn < Min ~ paste(Unit, "was burned recently."),
+          YearsSinceBurn > Max ~ paste(Unit, "has not been burned recently enough."),
+          TRUE ~ paste(Unit, "falls within the ideal rotation interval.")
+        )) %>%
+        ungroup()
+      
+      HTML(paste0("<ul>", paste0("<li>", df$message, "</li>", collapse = ""), "</ul>"))
+    })
   })
 }
 
 shinyApp(ui, server)
-
