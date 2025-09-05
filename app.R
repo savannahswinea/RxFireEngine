@@ -6,124 +6,54 @@ library(sf)
 library(readxl)
 library(leaflet)
 
-# packageVersion("curl")
-# packageVersion("httr2")
-
 # ---- Function to get 3-day weather ----
 # Inspired by https://3mw.albert-rapp.de/p/weather-api
-get_forecast <- function(lat, lon, start_date = Sys.Date()) {
+get_forecast <- function(lat, lon) {
+  # Get point metadata including grid data URL
+  point_meta <- request("https://api.weather.gov") |>
+    req_url_path_append("points", paste0(lat, ",", lon)) |>
+    req_perform() |>
+    resp_body_json()
   
-  # ---- Use NCEI for historical 2021 data ----
-  if (year(start_date) == 2021) {
-    
-    # NCEI token stored in environment variable
-    ncei_token <- Sys.getenv("ralplPZgDncehbSWtiZrhgVdUnKAjVyb")
-    
-    # Find nearest station
-    station_req <- request("https://www.ncei.noaa.gov/cdo-web/api/v2/stations") |>
-      req_url_query(
-        datasetid = "GHCND",
-        limit = 1,
-        startdate = start_date,
-        enddate = start_date,
-        latitude = lat,
-        longitude = lon
-      ) |>
-      req_headers(token = ncei_token) |>
-      req_perform() |>
-      resp_body_json()
-    
-    if (length(station_req$results) == 0) {
-      return(tibble(error = "No NCEI station found for this location/date"))
-    }
-    
-    station_id <- station_req$results[[1]]$id
-    
-    # Request daily data for 3 days
-    data_req <- request("https://www.ncei.noaa.gov/cdo-web/api/v2/data") |>
-      req_url_query(
-        datasetid = "GHCND",
-        stationid = station_id,
-        startdate = start_date,
-        enddate = start_date + 2,
-        units = "standard",
-        limit = 1000
-      ) |>
-      req_headers(token = ncei_token) |>
-      req_perform() |>
-      resp_body_json()
-    
-    # Convert to tibble
-    df <- map_dfr(data_req$results, function(x) {
-      tibble(
-        date = as_date(x$date),
-        variable = x$datatype,
-        value = x$value
-      )
-    })
-    
-    # Pivot to match variable names in app
-    df <- df %>%
-      pivot_wider(names_from = variable, values_from = value) %>%
-      rename(
-        max_temp = TMAX,
-        min_temp = TMIN,
-        precip_amt = PRCP,
-        wind_speed = AWND
-      ) %>%
+  grid_url <- point_meta$properties$forecastGridData
+  
+  grid_data <- request(grid_url) |>
+    req_perform() |>
+    resp_body_json() |>
+    pluck("properties")
+  
+  extract_quant_values <- function(var, label) {
+    tibble(
+      start_time = map_chr(var$values, "validTime"),
+      value = map_dbl(var$values, "value"),
+      variable = label
+    ) |>
+      separate(start_time, into = c("start", "duration"), sep = "/") |>
       mutate(
-        min_rh = NA  # Relative humidity not available in GHCND
+        start = ymd_hms(start),
+        date = as_date(start)
       )
-    
-    return(df)
-    
-  } else {
-    
-    # ---- NWS API for current/future forecasts ----
-    point_meta <- request("https://api.weather.gov") |>
-      req_url_path_append("points", paste0(lat, ",", lon)) |>
-      req_perform() |>
-      resp_body_json()
-    
-    grid_url <- point_meta$properties$forecastGridData
-    
-    grid_data <- request(grid_url) |>
-      req_perform() |>
-      resp_body_json() |>
-      pluck("properties")
-    
-    extract_quant_values <- function(var, label) {
-      tibble(
-        start_time = map_chr(var$values, "validTime"),
-        value = map_dbl(var$values, "value"),
-        variable = label
-      ) %>%
-        separate(start_time, into = c("start", "duration"), sep = "/") %>%
-        mutate(
-          start = ymd_hms(start),
-          date = as_date(start)
-        )
-    }
-    
-    temp_max <- extract_quant_values(grid_data$maxTemperature, "max_temp")
-    temp_min <- extract_quant_values(grid_data$minTemperature, "min_temp")
-    wind_speed <- extract_quant_values(grid_data$windSpeed, "wind_speed")
-    rh_min <- extract_quant_values(grid_data$minRelativeHumidity, "min_rh")
-    precip_amt <- extract_quant_values(grid_data$quantitativePrecipitation, "precip_amt")
-    
-    forecast_all <- bind_rows(temp_max, temp_min, wind_speed, rh_min, precip_amt) %>%
-      mutate(
-        value = ifelse(variable %in% c("max_temp", "min_temp"), value * 9/5 + 32, value)
-      ) %>%
-      filter(date >= start_date & date <= start_date + 2) %>%
-      group_by(date, variable) %>%
-      summarize(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
-      pivot_wider(names_from = variable, values_from = value)
-    
-    return(forecast_all)
-    
   }
+  
+  # Extract variables of interest
+  temp_max <- extract_quant_values(grid_data$maxTemperature, "max_temp") %>%
+    mutate(value = value * 9/5 + 32)   # Celsius -> Fahrenheit
+  temp_min <- extract_quant_values(grid_data$minTemperature, "min_temp") %>%
+    mutate(value = value * 9/5 + 32)   # Celsius -> Fahrenheit
+  wind_speed <- extract_quant_values(grid_data$windSpeed, "wind_speed")
+  rh_min <- extract_quant_values(grid_data$minRelativeHumidity, "min_rh")
+  precip_amt <- extract_quant_values(grid_data$quantitativePrecipitation, "precip_amt")
+  
+  # Combine and summarize to daily average values for next 3 days
+  forecast_all <- bind_rows(temp_max, temp_min, wind_speed, rh_min, precip_amt) |>
+    filter(date <= Sys.Date() + 3) |>
+    group_by(date, variable) |>
+    summarize(value = mean(value, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = variable, values_from = value)
+  
+  forecast_all
 }
+
 
 # ---- Function to generate utility function graphs ----
 double_logistic <- function(t, rise_mid, fall_mid, rise_slope = 0.1, fall_slope = 0.5,
@@ -144,38 +74,37 @@ ui <- fluidPage(
                column(8, offset = 2,
                       tags$div(
                         id = "welcome-text",
-                        tags$p("This app helps fire managers make prescribed burn decisions using short-term weather forecasts and habitat rotation intervals.",
-                               style = "margin-top: 20px;"),
-                        tags$h4("What You Need"),
+                        tags$h4("What You Need to Know"),
+                        tags$p("This app helps fire managers make prescribed burn decisions using short-term weather forecasts, historical weather information, and habitat rotation intervals."),
+                        tags$p("Our prototype focuses on the Eglin Air Force Base, located in Florida. We developed a tool that is able to recommend a burning schedule based on weather conditions and the expected benefit associated with how long ago units had been burned. This website demonstrates how decision-makers could interact with this tool."),
+                        tags$h4("Data Needs"),
                         tags$ul(
-                          tags$li("If you have a shapefile (.zip), the attribute table needs the following columns:"),
+                          tags$li("This app utilizes information with the following names and descriptions:"),
                           tags$ul(
                             tags$li("Unit: a unique name for each unit"),
                             tags$li("Habitat: a habitat classification for that unit"),
-                            tags$li("YearsSinceBurn: how many years ago a unit was burned")
+                            tags$li("YearLastBurned: the year a unit was last burned"),
+                            tags$li("Latitude, Longitude for each unit")
                           ),
-                          tags$li("If you have a spreadsheet (.csv or .xlsx), you also need Latitude and Longitude columns.")
                         ),
-                        tags$h4("Download Example Data"),
-                        tags$p(tags$a(href = "RxFire_example.xlsx", download = NA, "Click here to download the example spreadsheet.")
-                        ),
-                        tags$p("For questions or feedback, please contact Savannah Swinea at sswinea@ncsu.edu.")
-                      )
+                        tags$h4("More Information and Contact"),
+                        tags$p("The model developed to recommend burn schedules is described in detail in:"),
+                        tags$p("Majumder, R., Terando, A. J., Hiers, J. K., Collazo, J. A., & Reich, B. J. (2025). A spatiotemporal optimization engine for prescribed burning in the Southeast US. Ecological Informatics, 85. ",
+                        tags$a(href = "https://doi.org/10.1016/j.ecoinf.2024.102956", target = "_blank", "https://doi.org/10.1016/j.ecoinf.2024.102956")),
+                        tags$p(
+                          "For questions or feedback, please contact Savannah Swinea at",
+                          tags$a(href = "mailto:sswinea@ncsu.edu", "sswinea@ncsu.edu")
+                        )
                )
              )
+    )
     ),
     
     tabPanel("Weather Forecast",
              sidebarLayout(
                sidebarPanel(
-                 fileInput("file_upload", "Upload shapefile (.zip) or spreadsheet (.csv/.xlsx)"),
-                 dateInput(
-                   "forecast_date", 
-                   "Select start date for 3-day forecast:",
-                   value = as.Date("2021-01-01"),
-                   min = as.Date("2021-01-01"),
-                   max = as.Date("2021-12-29") # prevent spilling into 2022
-                 ),
+                 h4("Instructions"),
+                 p("Click the button below to fetch a 3-day weather forecast for five burn units in the Eglin Air Force Base."),
                  actionButton("run_forecast", "Run Forecast")
                ),
                mainPanel(
@@ -206,118 +135,122 @@ ui <- fluidPage(
     ),
     
     tabPanel("Burn Optimization",
+             sidebarLayout(
+               sidebarPanel(
+                 h4("Instructions"),
+                 p("Now that you have set the ideal rotation intervals for each habitat, click 'Generate Burn Schedule' to find out which units would be optimal to burn in the next three days."),
+                 br(),
+                 actionButton("burn_schedule", "Generate Burn Schedule")
+               ),
+               
              mainPanel(
+               h3("Optimal Burn Schedule"),
+               tableOutput("burn_table")
              )
     )
   )
 )
+)
 
 # ---- Server ----
 server <- function(input, output, session) {
-  shared <- reactiveValues(y = NULL, habitats = NULL)
+  shared <- reactiveValues(y = NULL, habitats = NULL, forecast = NULL)
   
-  # Helper to normalize lat/lon column names
-  normalize_latlon <- function(df) {
-    lat_names <- c("Latitude", "Lat", "latitude", "lat")
-    lon_names <- c("Longitude", "Long", "longitude", "long")
-    
-    lat_col <- intersect(names(df), lat_names)
-    lon_col <- intersect(names(df), lon_names)
-    
-    validate(
-      need(length(lat_col) > 0 && length(lon_col) > 0, 
-           "Spreadsheet must include recognizable latitude and longitude columns.")
+  # Read eglin2021.csv once, normalize lat/lon
+  get_points_from_file <- reactive({
+    app_dir <- tryCatch(
+      dirname(normalizePath(sys.frames()[[1]]$ofile)),
+      error = function(e) getwd()
     )
     
+    csv_path <- file.path(app_dir, "eglin2021.csv")
+    
+    validate(
+      need(file.exists(csv_path), paste("CSV not found at:", csv_path))
+    )
+    
+    df <- read.csv(csv_path)
+    
     df <- df |>
-      rename(Latitude = all_of(lat_col[1]),
-             Longitude = all_of(lon_col[1]))
+      dplyr::rename(Latitude = lat, Longitude = lon) |>
+      dplyr::mutate(SDSFEATURENAME = as.character(SDSFEATURENAME))
+    
+    df <- dplyr::sample_n(df, 5)
     
     df
-  }
-  
-  # Read uploaded file and extract lat/lon
-  get_points_from_upload <- reactive({
-    req(input$file_upload)
-    ext <- tools::file_ext(input$file_upload$name)
-    temp_dir <- tempdir()
-    
-    if (ext == "zip") {
-      unzip(input$file_upload$datapath, exdir = temp_dir)
-      shp_file <- list.files(temp_dir, pattern = "\\.shp$", full.names = TRUE)
-      shp_data <- st_read(shp_file[1])
-      centroids <- st_centroid(shp_data)
-      coords <- st_coordinates(centroids)
-      df <- data.frame(
-        Unit = shp_data$Name %||% paste0("Unit_", seq_len(nrow(shp_data))),
-        Latitude = coords[,2],
-        Longitude = coords[,1],
-        stringsAsFactors = FALSE
-      )
-      
-    } else if (ext %in% c("csv", "xlsx")) {
-      if (ext == "csv") {
-        df <- read_csv(input$file_upload$datapath)
-      } else {
-        df <- read_excel(input$file_upload$datapath)
-      }
-      
-      df <- normalize_latlon(df)
-    } else {
-      showNotification("Unsupported file type", type = "error")
-      return(NULL)
-    }
   })
   
-  # Run forecast on each point
-  forecast_data <- eventReactive(input$run_forecast, {
-    points <- get_points_from_upload()
-    req(points)
-    req(input$forecast_date)
+  # Run forecast on each point incrementally
+  observeEvent(input$run_forecast, {
+    points <- get_points_from_file()
+    n <- nrow(points)
     
-    points |>
-      rowwise() |>
-      mutate(
-        forecast = list(tryCatch(
-          get_forecast(Latitude, Longitude, start_date = input$forecast_date),
-          error = function(e) tibble(error = "NWS request failed"))
-        )
-      ) |>
-      unnest(forecast)
+    # Initialize forecast column as list
+    points$forecast <- vector("list", n)
+    shared$forecast <- points  # store in reactiveValues
+    
+    withProgress(message = "Running forecast...", value = 0, {
+      for (i in seq_len(n)) {
+        incProgress(i/n, detail = paste("Processing unit", i, "of", n, "-", points$SDSFEATURENAME[i]))
+        
+        fc <- tryCatch({
+          get_forecast(points$Latitude[i], points$Longitude[i])
+        }, error = function(e) {
+          tibble(
+            start = NA,
+            date = NA,
+            max_temp = NA,
+            min_temp = NA,
+            wind_speed = NA,
+            min_rh = NA,
+            precip_amt = NA
+          )
+        })
+        
+        shared$forecast$forecast[[i]] <- fc
+        
+        # Optional: small pause to ensure progress bar updates
+        Sys.sleep(0.05)
+      }
+      
+      # Unnest all forecasts
+      shared$forecast <- shared$forecast |> tidyr::unnest(cols = forecast)
+      setProgress(1, detail = "Forecast complete!")
+    })
   })
   
   # Map units
   output$unit_map <- renderLeaflet({
-    df <- forecast_data()
+    df <- shared$forecast
     req(df)
     
     leaflet(df) |>
       addTiles() |>
       addCircleMarkers(
         lng = ~Longitude, lat = ~Latitude,
-        label = ~Unit, radius = 5,
+        label = ~SDSFEATURENAME, radius = 5,
         fillOpacity = 0.8, color = "blue"
       )
   })
   
-  # Output max temp in 3-day interval for each unit
+  # Output max temp bullets
   output$forecast_bullets <- renderUI({
-    df <- forecast_data()
+    df <- shared$forecast
     req(df)
     
     df_max <- df |>
-      group_by(Unit) |>
+      group_by(SDSFEATURENAME) |>
       filter(max_temp == max(max_temp, na.rm = TRUE)) |>
-      slice_head(n = 1) |>   # In case of ties, take the first
+      slice_head(n = 1) |>
       ungroup()
     
     bullets <- df_max |>
       mutate(msg = paste0(
-        "<li><strong>", Unit, "</strong> will experience a maximum temperature of <strong>", 
+        "<li><strong>", SDSFEATURENAME, "</strong> will experience a maximum temperature of <strong>", 
         round(max_temp, 1), "\u00B0F</strong> on <strong>", format(date, "%b %d"), "</strong> in the next three days.</li>"
       )) |>
       pull(msg) |>
-      unname() |>   # drop names to avoid JSON warning
+      unname() |>
       paste(collapse = "\n")
     
     HTML(paste0("<ul>", bullets, "</ul>"))
@@ -325,15 +258,15 @@ server <- function(input, output, session) {
   
   # Reactive: Get unique habitats
   unique_habitats <- reactive({
-    req(get_points_from_upload())
-    unique(get_points_from_upload()$Habitat)
+    req(get_points_from_file())
+    unique(get_points_from_file()$Habitat)
   })
   
   # Dynamic UI: min/max inputs for each Habitat
   output$threshold_inputs <- renderUI({
     req(unique_habitats())
     lapply(unique_habitats(), function(hab) {
-      safe_id <- make.names(hab)  # sanitize input ID
+      safe_id <- make.names(hab)
       tagList(
         h4(hab),
         numericInput(paste0("min_", safe_id), "Min Years Since Burn", value = 1),
@@ -346,12 +279,11 @@ server <- function(input, output, session) {
   output$burn_feedback <- renderUI({
     req(input$evaluate)
     isolate({
-      df <- get_points_from_upload()
-      req(all(c("Unit", "Habitat", "YearsSinceBurn") %in% names(df)))
+      df <- get_points_from_file()
+      req(all(c("SDSFEATURENAME", "Habitat", "YLB") %in% names(df)))
       
       habs <- unique_habitats()
       
-      # Collect thresholds
       thresholds <- lapply(habs, function(hab) {
         safe_id <- make.names(hab)
         data.frame(
@@ -362,24 +294,23 @@ server <- function(input, output, session) {
         )
       }) %>% bind_rows()
       
-      # Join thresholds to input data
       df <- df %>% left_join(thresholds, by = "Habitat")
       
-      # Generate messages
       df <- df %>%
         rowwise() %>%
-        mutate(message = case_when(
-          is.na(YearsSinceBurn) ~ paste(Unit, "has missing burn data."),
-          YearsSinceBurn < Min ~ paste(Unit, "was burned recently."),
-          YearsSinceBurn > Max ~ paste(Unit, "has not been burned recently enough."),
-          TRUE ~ paste(Unit, "falls within the ideal rotation interval.")
-        )) %>%
+        mutate(ysb = lubridate::year(Sys.Date()) - YLB,
+               message = case_when(
+                 is.na(ysb) ~ paste(SDSFEATURENAME, "has missing burn data."),
+                 ysb < Min ~ paste(SDSFEATURENAME, "was burned recently."),
+                 ysb > Max ~ paste(SDSFEATURENAME, "has not been burned recently enough."),
+                 TRUE ~ paste(SDSFEATURENAME, "falls within the ideal rotation interval.")
+               )) %>%
         ungroup()
       
       HTML(paste0("<ul>", paste0("<li>", df$message, "</li>", collapse = ""), "</ul>"))
     })
   })
-
+  
   # Reactive: Generate plots for each habitat
   output$burn_graphs <- renderUI({
     req(input$evaluate)
@@ -391,26 +322,9 @@ server <- function(input, output, session) {
         min_val <- input[[paste0("min_", safe_id)]]
         max_val <- input[[paste0("max_", safe_id)]]
         
-        # x sequence
         x <- seq(0, 12.5, by = 0.01)
-        
-        # Generate utility curve using user thresholds
         util <- double_logistic(t = x, rise_mid = min_val, fall_mid = max_val)
         utildf <- data.frame(ysb = x, util = util)
-        
-        # Plot with ggplot
-        p <- ggplot(utildf, aes(x = ysb, y = util)) +
-          geom_line(color = "blue") +
-          geom_segment(aes(x = min_val, xend = min_val, y = 0, yend = 1), linetype = 5) +
-          geom_segment(aes(x = max_val, xend = max_val, y = 0, yend = 1), linetype = 5) +
-          labs(x = "Years since burn", y = "Utility",
-               title = paste("Habitat:", hab)) +
-          scale_x_continuous(limits = c(0, 13), breaks = seq(0, 12, 2)) +
-          scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .2)) +
-          theme_bw() +
-          theme(axis.title = element_text(size = 14),
-                axis.text = element_text(size = 12),
-                plot.title = element_text(size = 16, face = "bold"))
         
         plotOutput(paste0("plot_", safe_id))
       })
@@ -445,6 +359,22 @@ server <- function(input, output, session) {
                 plot.title = element_text(size = 16, face = "bold"))
       })
     })
+  })
+  
+  # Burn optimization table
+  output$burn_table <- renderTable({
+    req(input$burn_schedule) 
+    
+    df <- get_points_from_file()
+    req(df)
+    
+    day_labels <- c("1-day", "2-day", "3-day")
+    blank_cols <- as_tibble(matrix(NA_character_, nrow = nrow(df), ncol = 3))
+    colnames(blank_cols) <- day_labels
+    
+    table_df <- bind_cols(df["SDSFEATURENAME"], blank_cols) |>
+      rename(Unit = SDSFEATURENAME)
+    table_df
   })
 }
 
